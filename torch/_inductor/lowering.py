@@ -5984,17 +5984,32 @@ fallback_max_pool2d_with_indices_backward = fallback_handler(
 def max_pool2d_with_indices_backward(
     grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
 ):
-    if x.get_device().type == "xpu":
-        return fallback_max_pool2d_with_indices_backward(
-            grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
-        )
-
     if padding == 0:
         padding = [0, 0]
     if dilation == 1:
         dilation = [1, 1]
     if not stride:
         stride = kernel_size
+
+    nonoverlap = (
+        not ceil_mode
+        and padding[0] == 0
+        and padding[1] == 0
+        and dilation[0] == 1
+        and dilation[1] == 1
+        and stride[0] >= kernel_size[0]
+        and stride[1] >= kernel_size[1]
+    )
+
+    # Non-overlapping windows stay on the Triton lowering even on XPU: the
+    # simplified index math below is expected to close the gap with the eager
+    # fallback (#187940) on PVC while winning on client GPUs (BMG). If PVC
+    # measurements still favor eager for these shapes, drop `and not
+    # nonoverlap` here.
+    if x.get_device().type == "xpu" and not nonoverlap:
+        return fallback_max_pool2d_with_indices_backward(
+            grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
+        )
 
     if not (isinstance(x, TensorBox)):
         raise AssertionError("expected: isinstance(x, TensorBox)")
@@ -6070,6 +6085,31 @@ def max_pool2d_with_indices_backward(
     def fn(idx):
         *prefix, h, w = idx
         index_test = ops.index_expr(h * width + w, torch.int32)
+        if nonoverlap:
+            # stride >= kernel, pad=0, no ceil_mode (e.g. the common 2x2/2
+            # maxpool in vgg/vovnet-style CNNs): each input position maps to
+            # exactly one pooling window, so the clamped inverse-window
+            # arithmetic below degenerates to plain h//stride indexing and
+            # the window loop is a single iteration. Emit that directly —
+            # the general form leaves dozens of dead div/mod + clamp-predicate
+            # integer ops per element in the generated kernel.
+            grad_index = [
+                *prefix,
+                ops.indirect_indexing(
+                    ops.index_expr(FloorDiv(h, stride[0]), torch.int32),
+                    indices_size[-2],
+                    check=False,
+                ),
+                ops.indirect_indexing(
+                    ops.index_expr(FloorDiv(w, stride[1]), torch.int32),
+                    indices_size[-1],
+                    check=False,
+                ),
+            ]
+            index_actual = indices_loader(grad_index)
+            grad_part = grad_loader(grad_index)
+            check = ops.eq(index_actual, index_test)
+            return ops.where(check, grad_part, ops.constant(0.0, torch.float32))
         h = h + padding[0]
         w = w + padding[1]
         phstart = ops.index_expr(
