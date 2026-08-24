@@ -6026,6 +6026,11 @@ def max_pool2d_with_indices_backward(
     if not stride:
         stride = kernel_size
 
+    kernel_size = pad_listlike(kernel_size, 2)
+    stride = pad_listlike(stride, 2)
+    padding = pad_listlike(padding, 2)
+    dilation = pad_listlike(dilation, 2)
+
     nonoverlap = (
         not ceil_mode
         and padding[0] == 0
@@ -6036,11 +6041,7 @@ def max_pool2d_with_indices_backward(
         and stride[1] >= kernel_size[1]
     )
 
-    # Non-overlapping windows stay on the Triton lowering even on XPU: the
-    # simplified index math below is expected to close the gap with the eager
-    # fallback (#187940) on PVC while winning on client GPUs (BMG). If PVC
-    # measurements still favor eager for these shapes, drop `and not
-    # nonoverlap` here.
+    # Keep unsupported XPU configurations on the eager fallback.
     if x.get_device().type == "xpu" and not nonoverlap:
         return fallback_max_pool2d_with_indices_backward(
             grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
@@ -6082,8 +6083,9 @@ def max_pool2d_with_indices_backward(
     else:
         x_stride = x.maybe_get_stride()
 
-    is_channels_last = (x_stride is not None and x_stride[1] == 1) or (
-        gO_stride is not None and gO_stride[1] == 1
+    is_channels_last = len(x.get_size()) == 4 and (
+        (x_stride is not None and x_stride[1] == 1)
+        or (gO_stride is not None and gO_stride[1] == 1)
     )
     if any(d != 1 for d in dilation):
         # dilation NYI
@@ -6119,24 +6121,29 @@ def max_pool2d_with_indices_backward(
 
     def fn(idx):
         *prefix, h, w = idx
-        index_test = ops.index_expr(h * width + w, torch.int32)
+        index_test = ops.index_expr(h * width + w, torch.int64)
         if nonoverlap:
             # stride >= kernel, pad=0, no ceil_mode (e.g. the common 2x2/2
-            # maxpool in vgg/vovnet-style CNNs): each input position maps to
-            # exactly one pooling window, so the clamped inverse-window
-            # arithmetic below degenerates to plain h//stride indexing and
-            # the window loop is a single iteration. Emit that directly —
-            # the general form leaves dozens of dead div/mod + clamp-predicate
-            # integer ops per element in the generated kernel.
+            # maxpool in vgg/vovnet-style CNNs): each input position can
+            # contribute to at most one pooling window. Check that window
+            # directly, clamping positions after the final complete window.
+            ph = ops.minimum(
+                ops.index_expr(FloorDiv(h, stride[0]), torch.int64),
+                ops.index_expr(pooled_height - 1, torch.int64),
+            )
+            pw = ops.minimum(
+                ops.index_expr(FloorDiv(w, stride[1]), torch.int64),
+                ops.index_expr(pooled_width - 1, torch.int64),
+            )
             grad_index = [
                 *prefix,
                 ops.indirect_indexing(
-                    ops.index_expr(FloorDiv(h, stride[0]), torch.int32),
+                    ph,
                     indices_size[-2],
                     check=False,
                 ),
                 ops.indirect_indexing(
-                    ops.index_expr(FloorDiv(w, stride[1]), torch.int32),
+                    pw,
                     indices_size[-1],
                     check=False,
                 ),
