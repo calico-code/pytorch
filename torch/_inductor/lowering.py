@@ -6032,8 +6032,7 @@ def max_pool2d_with_indices_backward(
     dilation = pad_listlike(dilation, 2)
 
     nonoverlap = (
-        not ceil_mode
-        and padding[0] == 0
+        padding[0] == 0
         and padding[1] == 0
         and dilation[0] == 1
         and dilation[1] == 1
@@ -6123,18 +6122,21 @@ def max_pool2d_with_indices_backward(
         *prefix, h, w = idx
         index_test = ops.index_expr(h * width + w, torch.int64)
         if nonoverlap:
-            # stride >= kernel, pad=0, no ceil_mode (e.g. the common 2x2/2
-            # maxpool in vgg/vovnet-style CNNs): each input position can
-            # contribute to at most one pooling window. Check that window
-            # directly, clamping positions after the final complete window.
-            ph = ops.minimum(
-                ops.index_expr(FloorDiv(h, stride[0]), torch.int64),
-                ops.index_expr(pooled_height - 1, torch.int64),
-            )
-            pw = ops.minimum(
-                ops.index_expr(FloorDiv(w, stride[1]), torch.int64),
-                ops.index_expr(pooled_width - 1, torch.int64),
-            )
+            # stride >= kernel, pad=0 (e.g. 2x2 maxpool with stride 2): each
+            # input position can contribute to at most one pooling window.
+            # Check that window directly, clamping positions after the final
+            # complete window when ceil mode is disabled.
+            ph = ops.index_expr(FloorDiv(h, stride[0]), torch.int64)
+            pw = ops.index_expr(FloorDiv(w, stride[1]), torch.int64)
+            if not ceil_mode:
+                ph = ops.minimum(
+                    ph,
+                    ops.index_expr(pooled_height - 1, torch.int64),
+                )
+                pw = ops.minimum(
+                    pw,
+                    ops.index_expr(pooled_width - 1, torch.int64),
+                )
             grad_index = [
                 *prefix,
                 ops.indirect_indexing(
@@ -6149,9 +6151,8 @@ def max_pool2d_with_indices_backward(
                 ),
             ]
             index_actual = indices_loader(grad_index)
-            grad_part = grad_loader(grad_index)
             check = ops.eq(index_actual, index_test)
-            return ops.where(check, grad_part, ops.constant(0.0, torch.float32))
+            return ops.masked(check, lambda: grad_loader(grad_index), 0.0)
         h = h + padding[0]
         w = w + padding[1]
         phstart = ops.index_expr(
