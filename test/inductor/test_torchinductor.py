@@ -20823,6 +20823,30 @@ if RUN_GPU:
             code = run_and_get_triton_code(torch.compile(f), x, y)
             self.assertIn("ReductionHint.INNER", code)
 
+        @config.patch("triton.coalesce_tiling_analysis", True)
+        @unittest.skipIf(
+            GPU_TYPE != "xpu", "XPU-specific atomic-add reduction heuristic"
+        )
+        def test_reduction_hint_default_with_xpu_atomic_add(self):
+            """Keep DEFAULT for XPU reductions fused with an atomic add."""
+
+            def f(x, y, index):
+                scaled = x * y
+                summed = scaled.sum(dim=-1, keepdim=True)
+                value = (scaled - x * summed) * 0.125
+                out = torch.zeros(
+                    (x.shape[0], 1023), device=x.device, dtype=x.dtype
+                )
+                return out.index_add(1, index, value), value
+
+            x = torch.randn(2048, 512, device=GPU_TYPE)
+            y = torch.randn_like(x)
+            index = torch.arange(512, device=GPU_TYPE)
+
+            code = run_and_get_triton_code(torch.compile(f), x, y, index)
+            self.assertIn("ReductionHint.DEFAULT", code)
+            self.assertNotIn("ReductionHint.INNER", code)
+
         def test_numpy_on_gpu(self):
             x = np.arange(10, dtype=np.float32)
 

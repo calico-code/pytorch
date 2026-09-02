@@ -202,6 +202,14 @@ class SIMDKernelFeatures:
         """True if V.ops.{op_name} is used in node_schedule"""
         return bool(self.op_counts().get(op_name))
 
+    @cache_on_self
+    def has_atomic_add(self) -> bool:
+        return any(
+            isinstance(write, MemoryDep) and write.mode == "atomic_add"
+            for node in self.scheduler_nodes()
+            for write in node.read_writes.writes
+        )
+
     def get_mutations(self) -> OrderedSet[str]:
         mutations: OrderedSet[str] = OrderedSet()
         for node in self.scheduler_nodes():
@@ -313,9 +321,15 @@ class SIMDKernelFeatures:
             else:
                 reduction_hint_val = ReductionHint.DEFAULT
 
+            has_non_contiguous_pw = self.has_non_contiguous_pw_in_reduction_kernel()
+            avoid_inner_for_xpu_atomic_add = (
+                has_non_contiguous_pw
+                and self.has_atomic_add()
+                and V.graph.get_current_device_or_throw().type == "xpu"
+            )
             if (
                 reduction_hint_val == ReductionHint.INNER
-                and self.has_non_contiguous_pw_in_reduction_kernel()
+                and has_non_contiguous_pw
             ):
                 reduction_hint_val = ReductionHint.DEFAULT
 
@@ -325,6 +339,7 @@ class SIMDKernelFeatures:
                 and tiling_scores is not None
                 and "x" in tiling_scores
                 and "r0_" in tiling_scores
+                and not avoid_inner_for_xpu_atomic_add
             ):
                 if tiling_scores_suggest_inner_reduction(
                     tiling_scores, self.reduction_numel
