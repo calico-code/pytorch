@@ -2282,20 +2282,21 @@ class BenchmarkRunner:
             model_fp64 = None
             inputs_fp64 = None
             try:
-                model_fp64, inputs_fp64 = cast_to_fp64(
-                    self.deepcopy_and_maybe_parallelize(model),
-                    clone_inputs(example_inputs),
-                )
-                self.init_optimizer(name, current_device, model_fp64.parameters())
-                fp64_outputs = self.run_n_iterations(
-                    model_fp64, inputs_fp64, self.model_iter_fn
-                )
-                fp64_outputs = tree_map(
-                    lambda x: x.to(torch.float64)
-                    if isinstance(x, torch.Tensor) and x.is_floating_point()
-                    else x,
-                    fp64_outputs,
-                )
+                if not self.args.skip_fp64_check:
+                    model_fp64, inputs_fp64 = cast_to_fp64(
+                        self.deepcopy_and_maybe_parallelize(model),
+                        clone_inputs(example_inputs),
+                    )
+                    self.init_optimizer(name, current_device, model_fp64.parameters())
+                    fp64_outputs = self.run_n_iterations(
+                        model_fp64, inputs_fp64, self.model_iter_fn
+                    )
+                    fp64_outputs = tree_map(
+                        lambda x: x.to(torch.float64)
+                        if isinstance(x, torch.Tensor) and x.is_floating_point()
+                        else x,
+                        fp64_outputs,
+                    )
             except Exception:
                 log.warning(
                     "fp64 golden ref were not generated for %s. Setting accuracy check to cosine",
@@ -2464,7 +2465,8 @@ class BenchmarkRunner:
                         ):
                             correct_result = process_fn(correct_result)
                             new_result = process_fn(new_result)
-                            fp64_outputs = process_fn(fp64_outputs)
+                            if fp64_outputs is not None:
+                                fp64_outputs = process_fn(fp64_outputs)
 
                     if (
                         self.args.save_model_outputs_to
@@ -3420,7 +3422,9 @@ def parse_args(args=None):
         "--dashboard", action="store_true", help="Flag to tell that its a Dashboard run"
     )
     parser.add_argument(
-        "--skip-fp64-check", action="store_true", help="skip accuracy check using fp64"
+        "--skip-fp64-check",
+        action="store_true",
+        help="skip FP64 reference generation while still comparing compiled outputs with eager",
     )
     parser.add_argument(
         "--fast", "-f", action="store_true", help="skip slow benchmarks"
